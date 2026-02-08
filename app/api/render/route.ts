@@ -7,33 +7,65 @@ import ffprobeStatic from "ffprobe-static";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+export const dynamic = "force-dynamic";
 
-function runCmd(cmd: string, args: string[]) {
+function runCmd(cmd: string, args: string[], timeoutMs = 45000) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     const p = spawn(cmd, args);
     let stdout = "";
     let stderr = "";
 
+    const t = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {}
+      reject(new Error(`${cmd} timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
     p.stdout.on("data", (d) => (stdout += d.toString()));
     p.stderr.on("data", (d) => (stderr += d.toString()));
 
     p.on("close", (code) => {
+      clearTimeout(t);
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(stderr || `${cmd} exited with ${code}`));
     });
   });
 }
 
-async function getAudioDurationSeconds(ffprobePath: string, filePath: string): Promise<number> {
-  const { stdout } = await runCmd(ffprobePath, [
-    "-v",
-    "error",
-    "-show_entries",
-    "format=duration",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
-    filePath,
-  ]);
+// Kies binaries: Codespaces -> system, Vercel -> static
+function getBinaryPaths() {
+  const isVercel = !!process.env.VERCEL;
+
+  if (!isVercel) {
+    // Codespaces / lokaal: gebruik system binaries (die had jij al werkend)
+    return { ffmpegPath: "ffmpeg", ffprobePath: "ffprobe" };
+  }
+
+  // Vercel: gebruik bundled binaries
+  const ffmpegPath = typeof ffmpegStatic === "string" ? ffmpegStatic : "ffmpeg";
+
+  const anyProbe = ffprobeStatic as any;
+  const ffprobePath =
+    anyProbe && typeof anyProbe.path === "string" ? anyProbe.path : "ffprobe";
+
+  return { ffmpegPath, ffprobePath };
+}
+
+async function getAudioDurationSeconds(ffprobePath: string, filePath: string) {
+  const { stdout } = await runCmd(
+    ffprobePath,
+    [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ],
+    15000
+  );
 
   const dur = Number(stdout.trim());
   if (!Number.isFinite(dur) || dur <= 0) {
@@ -63,7 +95,7 @@ export async function POST(req: Request) {
       return new NextResponse("Missing public/audio/bgm.mp3", { status: 500 });
     }
 
-    // Timing zoals jij wil
+    // Timing
     const pre = 1.5;
     const post = 1.5;
 
@@ -108,47 +140,49 @@ export async function POST(req: Request) {
     const outFile = path.join(tmpDir, `spot-${Date.now()}.mp3`);
     await fs.writeFile(ttsFile, ttsBuffer);
 
-    // Vercel-proof binary paths
-    const ffmpegPath = (ffmpegStatic as string) || "ffmpeg";
-    const ffprobePath = (ffprobeStatic as string) || "ffprobe";
+    const { ffmpegPath, ffprobePath } = getBinaryPaths();
 
-    // Echte voice duur → jouw timing terug
+    // Echte voice duur
     const voiceDurRaw = await getAudioDurationSeconds(ffprobePath, ttsFile);
 
-    // Max 25s zoals je eerder had
+    // Max 25s totaal (zoals je had)
     let total = pre + voiceDurRaw + post;
     if (total > 25) total = 25;
 
     const maxVoice = Math.max(0.1, total - pre - post);
 
     // Mix + fade
-    await runCmd(ffmpegPath, [
-      "-y",
-      "-i",
-      ttsFile,
-      "-stream_loop",
-      "-1",
-      "-i",
-      bgmFile,
-      "-filter_complex",
-      `[0:a]atrim=0:${maxVoice.toFixed(3)},asetpts=N/SR/TB,volume=${voiceVol}[v];` +
-        `[v]adelay=${Math.round(pre * 1000)}|${Math.round(pre * 1000)}[vdel];` +
-        `[1:a]atrim=0:${pre.toFixed(3)},asetpts=N/SR/TB,volume=${bgmPrePostVol}[bpre];` +
-        `[1:a]atrim=${pre.toFixed(3)}:${(pre + maxVoice).toFixed(3)},asetpts=N/SR/TB,volume=${bgmDuringVol}[bdur];` +
-        `[1:a]atrim=${(pre + maxVoice).toFixed(3)}:${(pre + maxVoice + post).toFixed(3)},asetpts=N/SR/TB,volume=${bgmPrePostVol}[bpost];` +
-        `[bpre][bdur][bpost]concat=n=3:v=0:a=1[bgmfull];` +
-        `[bgmfull][vdel]amix=inputs=2:duration=first:dropout_transition=0[m];` +
-        `[m]afade=t=out:st=${Math.max(0, total - post).toFixed(3)}:d=${post.toFixed(3)}[out]`,
-      "-map",
-      "[out]",
-      "-t",
-      total.toFixed(3),
-      "-c:a",
-      "libmp3lame",
-      "-b:a",
-      "192k",
-      outFile,
-    ]);
+    await runCmd(
+      ffmpegPath,
+      [
+        "-y",
+        "-i",
+        ttsFile,
+        "-stream_loop",
+        "-1",
+        "-i",
+        bgmFile,
+        "-filter_complex",
+        `[0:a]atrim=0:${maxVoice.toFixed(3)},asetpts=N/SR/TB,volume=${voiceVol}[v];` +
+          `[v]adelay=${Math.round(pre * 1000)}|${Math.round(pre * 1000)}[vdel];` +
+          `[1:a]atrim=0:${pre.toFixed(3)},asetpts=N/SR/TB,volume=${bgmPrePostVol}[bpre];` +
+          `[1:a]atrim=${pre.toFixed(3)}:${(pre + maxVoice).toFixed(3)},asetpts=N/SR/TB,volume=${bgmDuringVol}[bdur];` +
+          `[1:a]atrim=${(pre + maxVoice).toFixed(3)}:${(pre + maxVoice + post).toFixed(3)},asetpts=N/SR/TB,volume=${bgmPrePostVol}[bpost];` +
+          `[bpre][bdur][bpost]concat=n=3:v=0:a=1[bgmfull];` +
+          `[bgmfull][vdel]amix=inputs=2:duration=first:dropout_transition=0[m];` +
+          `[m]afade=t=out:st=${Math.max(0, total - post).toFixed(3)}:d=${post.toFixed(3)}[out]`,
+        "-map",
+        "[out]",
+        "-t",
+        total.toFixed(3),
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        outFile,
+      ],
+      45000
+    );
 
     const outBuffer = await fs.readFile(outFile);
 
