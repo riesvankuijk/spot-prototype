@@ -2,8 +2,11 @@ import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
+import ffmpegStatic from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 function runCmd(cmd: string, args: string[]) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
@@ -21,9 +24,8 @@ function runCmd(cmd: string, args: string[]) {
   });
 }
 
-async function getAudioDurationSeconds(filePath: string): Promise<number> {
-  // ffprobe is included with ffmpeg install
-  const { stdout } = await runCmd("ffprobe", [
+async function getAudioDurationSeconds(ffprobePath: string, filePath: string): Promise<number> {
+  const { stdout } = await runCmd(ffprobePath, [
     "-v",
     "error",
     "-show_entries",
@@ -33,17 +35,11 @@ async function getAudioDurationSeconds(filePath: string): Promise<number> {
     filePath,
   ]);
 
-  const s = stdout.trim();
-  const dur = Number(s);
-
+  const dur = Number(stdout.trim());
   if (!Number.isFinite(dur) || dur <= 0) {
-    throw new Error(`Could not read duration via ffprobe: "${s}"`);
+    throw new Error(`Could not read duration via ffprobe: "${stdout.trim()}"`);
   }
   return dur;
-}
-
-async function runFfmpeg(args: string[]) {
-  await runCmd("ffmpeg", args);
 }
 
 export async function POST(req: Request) {
@@ -60,8 +56,28 @@ export async function POST(req: Request) {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) return new NextResponse("Missing ELEVENLABS_API_KEY", { status: 500 });
 
-    // 1) TTS ophalen
-    const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+    const bgmFile = path.join(process.cwd(), "public/audio/bgm.mp3");
+    try {
+      await fs.access(bgmFile);
+    } catch {
+      return new NextResponse("Missing public/audio/bgm.mp3", { status: 500 });
+    }
+
+    // Timing zoals jij wil
+    const pre = 1.5;
+    const post = 1.5;
+
+    // Volumes
+    const bgmPrePostVol = 0.40;
+    const bgmDuringVol = 0.30;
+    const voiceVol = 1.20;
+
+    // ElevenLabs sneller
+    const ttsUrl =
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}` +
+      `?optimize_streaming_latency=4&output_format=mp3_44100_128`;
+
+    const ttsRes = await fetch(ttsUrl, {
       method: "POST",
       headers: {
         "xi-api-key": apiKey,
@@ -87,80 +103,46 @@ export async function POST(req: Request) {
 
     const ttsBuffer = Buffer.from(await ttsRes.arrayBuffer());
 
-    // 2) Files
     const tmpDir = "/tmp";
     const ttsFile = path.join(tmpDir, `tts-${Date.now()}.mp3`);
     const outFile = path.join(tmpDir, `spot-${Date.now()}.mp3`);
-
     await fs.writeFile(ttsFile, ttsBuffer);
 
-    const bgmFile = path.join(process.cwd(), "public/audio/bgm.mp3");
+    // Vercel-proof binary paths
+    const ffmpegPath = (ffmpegStatic as string) || "ffmpeg";
+    const ffprobePath = (ffprobeStatic as string) || "ffprobe";
 
-    // Check bgm exists
-    try {
-      await fs.access(bgmFile);
-    } catch {
-      return new NextResponse("Missing public/audio/bgm.mp3", { status: 500 });
-    }
+    // Echte voice duur → jouw timing terug
+    const voiceDurRaw = await getAudioDurationSeconds(ffprobePath, ttsFile);
 
-    // 3) Durations & timing
-    const pre = 1.5; // sec muziek vóór voice
-    const post = 1.5; // sec muziek na voice (incl fade-out)
-    const voiceDur = await getAudioDurationSeconds(ttsFile);
-
-    // Total length (cap op 25 sec indien je dat wil)
-    let total = pre + voiceDur + post;
-    // Als je altijd max 25 wil, laat dit aan:
+    // Max 25s zoals je eerder had
+    let total = pre + voiceDurRaw + post;
     if (total > 25) total = 25;
 
-    // In dat geval wordt voice ook gecapt zodat er altijd nog post overblijft
     const maxVoice = Math.max(0.1, total - pre - post);
 
-    // Volumes (tweak hier)
-    const bgmPrePostVol = 0.55; // "harder" intro/outro bedje
-    const bgmDuringVol = 0.80;  // "zachter" tijdens voice, maar harder dan je huidige 0.18
-    const voiceVol = 0.80;      // voice iets omhoog voor verstaanbaarheid
-
-    // 4) Build mix
-    // - bgm loopt door (loop)
-    // - knip bgm in 3 segmenten met verschillende volumes
-    // - voice start na 1.5s (adelay)
-    // - mix voice + bgm
-    // - fade out in de laatste 1.5 sec
-    await runFfmpeg([
+    // Mix + fade
+    await runCmd(ffmpegPath, [
       "-y",
-
-      // Voice input
       "-i",
       ttsFile,
-
-      // Loop bgm (indien korter)
       "-stream_loop",
       "-1",
       "-i",
       bgmFile,
-
       "-filter_complex",
-      // Voice trim + volume + delay
       `[0:a]atrim=0:${maxVoice.toFixed(3)},asetpts=N/SR/TB,volume=${voiceVol}[v];` +
         `[v]adelay=${Math.round(pre * 1000)}|${Math.round(pre * 1000)}[vdel];` +
-        // BGM segments: pre, during, post
         `[1:a]atrim=0:${pre.toFixed(3)},asetpts=N/SR/TB,volume=${bgmPrePostVol}[bpre];` +
         `[1:a]atrim=${pre.toFixed(3)}:${(pre + maxVoice).toFixed(3)},asetpts=N/SR/TB,volume=${bgmDuringVol}[bdur];` +
         `[1:a]atrim=${(pre + maxVoice).toFixed(3)}:${(pre + maxVoice + post).toFixed(3)},asetpts=N/SR/TB,volume=${bgmPrePostVol}[bpost];` +
         `[bpre][bdur][bpost]concat=n=3:v=0:a=1[bgmfull];` +
-        // Mix (duration = bgmfull)
         `[bgmfull][vdel]amix=inputs=2:duration=first:dropout_transition=0[m];` +
-        // Fade out in last 1.5 sec
         `[m]afade=t=out:st=${Math.max(0, total - post).toFixed(3)}:d=${post.toFixed(3)}[out]`,
-
       "-map",
       "[out]",
-
-      // Total length hard cap
       "-t",
       total.toFixed(3),
-
       "-c:a",
       "libmp3lame",
       "-b:a",
