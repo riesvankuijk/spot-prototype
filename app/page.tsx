@@ -22,7 +22,8 @@ export default function Page() {
     setAudioUrl(null);
 
     try {
-      const res = await fetch(`${API}/render`, {
+      const res = await fetch(`${API}/api/render`, {
+
         method: "POST",
         headers: {
           "Content-Type": "application/json",
